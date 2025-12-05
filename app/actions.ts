@@ -1,9 +1,8 @@
 'use server'
 
-import { PrismaClient } from '@prisma/client'
+import { prisma } from '@/lib/prisma'
+import { revalidatePath } from 'next/cache'
 import { calculateLogValuation, LOG_BASIS } from '@/lib/calculator'
-
-const prisma = new PrismaClient()
 
 export async function createLog(formData: FormData) {
     const supplierId = formData.get('supplierId') as string
@@ -61,6 +60,7 @@ export async function getMasterData() {
 }
 
 export async function getInventory(search?: string) {
+    // Fetch ALL logs for the table (audit trail)
     const logs = await prisma.log.findMany({
         where: search ? {
             tagId: { contains: search }
@@ -74,17 +74,18 @@ export async function getInventory(search?: string) {
         }
     })
 
-    // Calculate KPIs
-    const totalLogs = logs.length
-    const totalVolume = logs.reduce((sum, log) => sum + log.volumeFinal, 0)
-    const totalValue = logs.reduce((sum, log) => sum + log.totalPurchasePrice, 0)
+    // Calculate KPIs only for IN_STOCK logs
+    const inStockLogs = logs.filter(log => log.status === 'IN_STOCK')
+    const totalLogs = inStockLogs.length
+    const totalVolume = inStockLogs.reduce((sum, log) => sum + log.volumeFinal, 0)
+    const totalValue = inStockLogs.reduce((sum, log) => sum + log.totalPurchasePrice, 0)
 
     return {
-        logs,
+        logs, // All logs for table
         kpis: {
-            totalLogs,
-            totalVolume,
-            totalValue
+            totalLogs,      // Count of IN_STOCK only
+            totalVolume,    // Volume of IN_STOCK only
+            totalValue      // Value of IN_STOCK only
         }
     }
 }
@@ -98,11 +99,14 @@ interface ProductionOutput {
     quantity: number
 }
 
-export async function recordProductionRun(
-    batchDate: Date,
-    logIds: string[],
+interface ProductionRunInput {
+    batchDate: Date
+    logIds: string[]
     outputs: ProductionOutput[]
-) {
+}
+
+export async function recordProductionRun(input: ProductionRunInput) {
+    const { batchDate, logIds, outputs } = input
     // Step 1: Fetch and validate Logs
     const logs = await prisma.log.findMany({
         where: { id: { in: logIds } }
@@ -226,7 +230,9 @@ export async function recordProductionRun(
 
 // Helper: Get available logs for production
 export async function getAvailableLogs() {
-    return prisma.log.findMany({
+    revalidatePath('/produksi') // Force fresh data
+
+    const logs = await prisma.log.findMany({
         where: { status: 'IN_STOCK' },
         include: {
             supplier: true,
@@ -234,6 +240,9 @@ export async function getAvailableLogs() {
         },
         orderBy: { purchaseDate: 'desc' }
     })
+
+    console.log('SERVER DEBUG: Found logs:', logs.length)
+    return logs
 }
 
 // Helper: Get product types for production form
@@ -241,4 +250,83 @@ export async function getProductTypes() {
     return prisma.productType.findMany({
         orderBy: { name: 'asc' }
     })
+}
+
+// ============================================
+// WAREHOUSE / FINISHED GOODS
+// ============================================
+
+export async function getProductInventory() {
+    const products = await prisma.productType.findMany({
+        orderBy: { stockCount: 'desc' } // Highest stock first
+    })
+
+    const inventory = products.map(product => ({
+        id: product.id,
+        name: product.name,
+        sku: product.sku,
+        standardVolume: product.standardVolume,
+        stockCount: product.stockCount,
+        totalVolume: product.stockCount * product.standardVolume
+    }))
+
+    // KPIs
+    const totalItems = inventory.reduce((sum, p) => sum + p.stockCount, 0)
+    const totalPoints = inventory.reduce((sum, p) => sum + p.totalVolume, 0)
+    const marketValue = totalPoints * 5000 // Rp 5000 per point
+
+    return {
+        products: inventory,
+        kpis: {
+            totalItems,
+            totalPoints,
+            marketValue
+        }
+    }
+}
+
+export async function getProductHistory(productTypeId: string) {
+    const outputs = await prisma.productionOutput.findMany({
+        where: { productTypeId },
+        include: {
+            batch: true
+        },
+        orderBy: { batch: { date: 'desc' } },
+        take: 10
+    })
+
+    return outputs.map(output => ({
+        id: output.id,
+        batchDate: output.batch.date,
+        quantity: output.quantity,
+        volumeProduced: output.volumeProduced
+    }))
+}
+
+// Client-side aliases with error handling
+export async function getInStockLogs() {
+    console.log("SERVER: Fetching IN_STOCK logs...");
+    try {
+        const logs = await prisma.log.findMany({
+            where: { status: "IN_STOCK" },
+            include: { woodType: true, supplier: true },
+            orderBy: { purchaseDate: 'desc' }
+        });
+        console.log(`SERVER: Found ${logs.length} logs.`);
+        return logs;
+    } catch (error) {
+        console.error("SERVER ERROR in getInStockLogs:", error);
+        return [];
+    }
+}
+
+export async function getProducts() {
+    try {
+        return await prisma.productType.findMany({
+            orderBy: { name: 'asc' }
+        });
+    } catch (error) {
+        console.error("SERVER ERROR in getProducts:", error);
+        return [];
+    }
 }

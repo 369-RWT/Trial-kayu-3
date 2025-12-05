@@ -23,7 +23,12 @@ export default function Home() {
                     </Link>
                     <Link href="/inventory">
                         <Button variant="outline" className="w-full h-12 text-lg">
-                            View Inventory
+                            📦 Raw Inventory
+                        </Button>
+                    </Link>
+                    <Link href="/gudang">
+                        <Button variant="outline" className="w-full h-12 text-lg border-emerald-500 text-emerald-600 hover:bg-emerald-50">
+                            🏪 Finished Goods
                         </Button>
                     </Link>
                     <div className="text-xs text-center text-slate-400 pt-2">

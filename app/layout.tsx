@@ -7,6 +7,8 @@ export const metadata: Metadata = {
     description: "Timber Manufacturing System",
 };
 
+import GlobalHeader from "@/components/GlobalHeader";
+
 export default function RootLayout({
     children,
 }: Readonly<{
@@ -14,10 +16,11 @@ export default function RootLayout({
 }>) {
     return (
         <html lang="en">
-            <body
-                className={`antialiased font-sans`}
-            >
-                {children}
+            <body className="antialiased font-sans bg-slate-50 min-h-screen">
+                <GlobalHeader />
+                <main>
+                    {children}
+                </main>
             </body>
         </html>
     );
