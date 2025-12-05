@@ -1,0 +1,140 @@
+// Al Fath Kayu - Production Database Schema
+// Updated to match Real Production Spreadsheet
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+// ============================================
+// MASTER DATA
+// ============================================
+
+// Supplier Master (Mukit, etc.)
+model Supplier {
+  id   String @id @default(cuid())
+  code String @unique // S001, S002
+  name String         // Mukit, Ahmad
+
+  logs Log[]
+}
+
+// Wood Type Master (Laut, Mahoni, Jati)
+model WoodType {
+  id   String @id @default(cuid())
+  name String @unique // Laut, Mahoni, Jati
+
+  logs Log[]
+}
+
+// ============================================
+// RAW MATERIAL (LOGS)
+// ============================================
+
+model Log {
+  id    String @id @default(cuid())
+  tagId String @unique // Physical barcode/tag
+
+  // Dimensions (matching spreadsheet)
+  circumference Int // cm (Lingkar) - e.g., 87
+  length        Int // cm (Panjang) - e.g., 300
+  quantity      Int @default(1) // Jumlah Log
+
+  // Stored Calculations
+  diameter    Float // circumference / 4
+  volumeRaw   Float // Full decimal before division
+  volumeFinal Int   // After "Million Point" rule (the "222" value)
+
+  // Calculation Factor (for audit)
+  calculationFactor Int @default(785)
+
+  // Financials
+  marketPricePerUnit Float // Harga Pasar (e.g., 1300)
+  totalPurchasePrice Float // volumeFinal * marketPricePerUnit
+
+  // Status
+  status       String   @default("IN_STOCK")
+  purchaseDate DateTime @default(now())
+
+  // Relations
+  supplierId String
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  woodTypeId String
+  woodType   WoodType @relation(fields: [woodTypeId], references: [id])
+
+  productionBatchId String?
+  productionBatch   ProductionBatch? @relation(fields: [productionBatchId], references: [id])
+
+  transactions InventoryLedger[]
+}
+
+// ============================================
+// PRODUCTION
+// ============================================
+
+model ProductionBatch {
+  id   String   @id @default(cuid())
+  date DateTime @default(now())
+
+  targetVolume Float
+
+  logsConsumed Log[]
+  outputs      ProductionOutput[]
+  waste        WasteRecord[]
+}
+
+model ProductType {
+  id   String @id @default(cuid())
+  name String @unique
+  sku  String @unique
+
+  standardVolume Float
+  stockCount     Int   @default(0)
+
+  outputs ProductionOutput[]
+}
+
+model ProductionOutput {
+  id String @id @default(cuid())
+
+  batchId String
+  batch   ProductionBatch @relation(fields: [batchId], references: [id])
+
+  productTypeId String
+  productType   ProductType @relation(fields: [productTypeId], references: [id])
+
+  quantity       Int
+  volumeProduced Float
+}
+
+// ============================================
+// WASTE & AUDIT
+// ============================================
+
+model WasteRecord {
+  id String @id @default(cuid())
+
+  batchId String
+  batch   ProductionBatch @relation(fields: [batchId], references: [id])
+
+  volumeLoss Float
+  reason     String
+
+  recordedAt DateTime @default(now())
+}
+
+model InventoryLedger {
+  id String @id @default(cuid())
+
+  logId String?
+  log   Log?   @relation(fields: [logId], references: [id])
+
+  action       String
+  amountChange Float
+  date         DateTime @default(now())
+}
