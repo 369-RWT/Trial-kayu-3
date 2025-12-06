@@ -1,7 +1,8 @@
-import { getMasterData } from '@/app/actions'
+import { getMasterData } from '@/app/actions' // Ensure this import is valid
 import PurchaseForm from './purchase-form'
 
 export default async function PurchasePage() {
+    // This connects to the database. If your DB is down, this might throw an error.
     const { suppliers, woodTypes } = await getMasterData()
 
     return (

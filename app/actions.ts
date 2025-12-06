@@ -4,6 +4,10 @@ import { prisma } from '@/lib/prisma'
 import { revalidatePath } from 'next/cache'
 import { calculateLogValuation, LOG_BASIS } from '@/lib/calculator'
 
+// ============================================
+// PURCHASING & LOG CREATION
+// ============================================
+
 export async function createLog(formData: FormData) {
     const supplierId = formData.get('supplierId') as string
     const woodTypeId = formData.get('woodTypeId') as string
@@ -25,6 +29,7 @@ export async function createLog(formData: FormData) {
                 circumference,
                 length,
                 quantity,
+                remainingQuantity: quantity, // <--- CRITICAL: Initialize Gas Tank
                 diameter: valuation.diameter,
                 volumeRaw: valuation.rawVolume,
                 volumeFinal: valuation.volumeFinal,
@@ -37,7 +42,6 @@ export async function createLog(formData: FormData) {
             }
         })
 
-        // Create simple inventory ledger entry
         await prisma.inventoryLedger.create({
             data: {
                 logId: log.id,
@@ -53,6 +57,10 @@ export async function createLog(formData: FormData) {
     }
 }
 
+// ============================================
+// READ & REPORTING
+// ============================================
+
 export async function getMasterData() {
     const suppliers = await prisma.supplier.findMany()
     const woodTypes = await prisma.woodType.findMany()
@@ -60,39 +68,45 @@ export async function getMasterData() {
 }
 
 export async function getInventory(search?: string) {
-    // Fetch ALL logs for the table (audit trail)
     const logs = await prisma.log.findMany({
-        where: search ? {
-            tagId: { contains: search }
-        } : undefined,
-        include: {
-            supplier: true,
-            woodType: true,
-        },
-        orderBy: {
-            purchaseDate: 'desc'
+        where: search ? { tagId: { contains: search } } : undefined,
+        include: { supplier: true, woodType: true },
+        orderBy: { purchaseDate: 'desc' }
+    })
+
+    // KPI Logic: Only count what is physically remaining
+    // Formula: (VolumeFinal / OriginalQty) * RemainingQty
+    let totalVolume = 0
+    let totalValue = 0
+    let activeLogCount = 0
+
+    logs.forEach(log => {
+        if (log.remainingQuantity > 0) {
+            activeLogCount++
+            const ratio = log.remainingQuantity / log.quantity
+            totalVolume += log.volumeFinal * ratio
+            totalValue += log.totalPurchasePrice * ratio
         }
     })
 
-    // Calculate KPIs only for IN_STOCK logs
-    const inStockLogs = logs.filter(log => log.status === 'IN_STOCK')
-    const totalLogs = inStockLogs.length
-    const totalVolume = inStockLogs.reduce((sum, log) => sum + log.volumeFinal, 0)
-    const totalValue = inStockLogs.reduce((sum, log) => sum + log.totalPurchasePrice, 0)
-
     return {
-        logs, // All logs for table
+        logs,
         kpis: {
-            totalLogs,      // Count of IN_STOCK only
-            totalVolume,    // Volume of IN_STOCK only
-            totalValue      // Value of IN_STOCK only
+            totalLogs: activeLogCount,
+            totalVolume: Math.round(totalVolume),
+            totalValue: Math.round(totalValue)
         }
     }
 }
 
 // ============================================
-// PRODUCTION TRANSACTION
+// PRODUCTION TRANSACTION (The Core FIFO Logic)
 // ============================================
+
+interface LogAllocation {
+    logId: string
+    qtyUsed: number
+}
 
 interface ProductionOutput {
     productTypeId: string
@@ -101,232 +115,210 @@ interface ProductionOutput {
 
 interface ProductionRunInput {
     batchDate: Date
-    logIds: string[]
+    allocations: LogAllocation[] // <--- UPDATED: Receives precise usage
     outputs: ProductionOutput[]
 }
 
 export async function recordProductionRun(input: ProductionRunInput) {
-    const { batchDate, logIds, outputs } = input
-    // Step 1: Fetch and validate Logs
+    const { batchDate, allocations, outputs } = input
+
+    // 1. Validation: Ensure we aren't using ghost logs
+    const logIds = allocations.map(a => a.logId)
     const logs = await prisma.log.findMany({
         where: { id: { in: logIds } }
     })
 
     if (logs.length !== logIds.length) {
-        return { success: false, error: 'Some logs were not found' }
+        return { success: false, error: 'One or more logs not found in database.' }
     }
 
-    const invalidLogs = logs.filter(log => log.status !== 'IN_STOCK')
-    if (invalidLogs.length > 0) {
-        return {
-            success: false,
-            error: `Logs not available: ${invalidLogs.map(l => l.tagId).join(', ')}`
+    // Map for faster lookup
+    const logMap = new Map(logs.map(l => [l.id, l]))
+
+    // 2. Calculate Total Input Volume (The "Cost" of Production)
+    let totalInputVolume = 0
+
+    for (const alloc of allocations) {
+        const log = logMap.get(alloc.logId)!
+
+        // Safety Check: Over-drafting
+        if (alloc.qtyUsed > log.remainingQuantity) {
+            return {
+                success: false,
+                error: `Log ${log.tagId} has only ${log.remainingQuantity} left, but you tried to use ${alloc.qtyUsed}.`
+            }
         }
+
+        const volumePerUnit = log.volumeFinal / log.quantity
+        totalInputVolume += volumePerUnit * alloc.qtyUsed
     }
 
-    const totalInput = logs.reduce((sum, log) => sum + log.volumeFinal, 0)
-
-    // Step 2: Fetch Products and calculate output
+    // 3. Calculate Total Output Volume
     const productIds = outputs.map(o => o.productTypeId)
     const products = await prisma.productType.findMany({
         where: { id: { in: productIds } }
     })
-
-    if (products.length !== productIds.length) {
-        return { success: false, error: 'Some products were not found' }
-    }
-
     const productMap = new Map(products.map(p => [p.id, p]))
 
-    let totalOutput = 0
-    for (const output of outputs) {
-        const product = productMap.get(output.productTypeId)
-        if (!product) continue
-        totalOutput += output.quantity * product.standardVolume
+    let totalOutputVolume = 0
+    for (const out of outputs) {
+        const product = productMap.get(out.productTypeId)
+        if (!product) return { success: false, error: 'Product type not found' }
+        totalOutputVolume += out.quantity * product.standardVolume
     }
 
-    // Step 3: Calculate waste
-    const waste = totalInput - totalOutput
+    const waste = totalInputVolume - totalOutputVolume
 
-    // Step 4: Physics validation
+    // 4. Physics Check
     if (waste < 0) {
         return {
             success: false,
-            error: `Physics Violation: Output (${totalOutput} pts) exceeds Input (${totalInput} pts)`
+            error: `Physics Violation: Output (${Math.round(totalOutputVolume)}) > Input (${Math.round(totalInputVolume)})`
         }
     }
 
-    // Step 5: Execute transaction
+    // 5. EXECUTE TRANSACTION
     try {
         const result = await prisma.$transaction(async (tx) => {
-            // Create Production Batch
+            // A. Create Batch
             const batch = await tx.productionBatch.create({
                 data: {
                     date: batchDate,
-                    targetVolume: totalInput,
+                    targetVolume: totalInputVolume
                 }
             })
 
-            // Update Logs: mark as CONSUMED and link to batch
-            await tx.log.updateMany({
-                where: { id: { in: logIds } },
-                data: {
-                    status: 'CONSUMED',
-                    productionBatchId: batch.id
-                }
-            })
+            // B. Consume Logs (The Ledger Logic)
+            for (const alloc of allocations) {
+                const log = logMap.get(alloc.logId)!
+                const newRemaining = log.remainingQuantity - alloc.qtyUsed
 
-            // Create Production Outputs
-            for (const output of outputs) {
-                const product = productMap.get(output.productTypeId)!
+                // Determine Status
+                let newStatus = 'IN_STOCK'
+                if (newRemaining === 0) newStatus = 'CONSUMED'
+                else if (newRemaining < log.quantity) newStatus = 'PARTIAL'
 
-                await tx.productionOutput.create({
+                // Update Log
+                await tx.log.update({
+                    where: { id: log.id },
                     data: {
-                        batchId: batch.id,
-                        productTypeId: output.productTypeId,
-                        quantity: output.quantity,
-                        volumeProduced: output.quantity * product.standardVolume
+                        remainingQuantity: newRemaining,
+                        status: newStatus,
+                        // If fully consumed, link to batch. If partial, we technically 
+                        // shouldn't link the *whole* log to one batch, but for now 
+                        // we can leave productionBatchId null or create a junction table later.
+                        // For this iteration: Only link if CONSUMED to keep lineage simple.
+                        productionBatchId: newRemaining === 0 ? batch.id : undefined
                     }
                 })
 
-                // Update product stock count
-                await tx.productType.update({
-                    where: { id: output.productTypeId },
+                // Ledger Entry for Audit
+                const volumeUsed = (log.volumeFinal / log.quantity) * alloc.qtyUsed
+                const valueUsed = (log.totalPurchasePrice / log.quantity) * alloc.qtyUsed
+
+                await tx.inventoryLedger.create({
                     data: {
-                        stockCount: { increment: output.quantity }
+                        logId: log.id,
+                        action: 'PRODUCTION_USE',
+                        amountChange: -valueUsed // Negative value for usage
                     }
                 })
             }
 
-            // Create Waste Record
+            // C. Create Outputs
+            for (const out of outputs) {
+                const product = productMap.get(out.productTypeId)!
+                await tx.productionOutput.create({
+                    data: {
+                        batchId: batch.id,
+                        productTypeId: out.productTypeId,
+                        quantity: out.quantity,
+                        volumeProduced: out.quantity * product.standardVolume
+                    }
+                })
+
+                // Increase Finished Goods Stock
+                await tx.productType.update({
+                    where: { id: out.productTypeId },
+                    data: { stockCount: { increment: out.quantity } }
+                })
+            }
+
+            // D. Record Waste
             await tx.wasteRecord.create({
                 data: {
                     batchId: batch.id,
                     volumeLoss: waste,
-                    reason: 'Production Waste (Auto-calculated)'
+                    reason: 'Production Run'
                 }
             })
 
             return batch
         })
 
-        const efficiency = totalInput > 0 ? (totalOutput / totalInput) * 100 : 0
+        const efficiency = totalInputVolume > 0 ? (totalOutputVolume / totalInputVolume) * 100 : 0
+
+        revalidatePath('/inventory')
+        revalidatePath('/gudang')
 
         return {
             success: true,
             batchId: result.id,
             summary: {
-                totalInput,
-                totalOutput,
-                waste,
-                efficiency: Math.round(efficiency * 100) / 100 // 2 decimal places
+                efficiency: Math.round(efficiency * 100) / 100
             }
         }
+
     } catch (error) {
-        console.error('Production transaction failed:', error)
-        return { success: false, error: 'Transaction failed' }
+        console.error('Production Error:', error)
+        return { success: false, error: 'Transaction Failed' }
     }
 }
 
-// Helper: Get available logs for production
-export async function getAvailableLogs() {
-    revalidatePath('/produksi') // Force fresh data
+// ============================================
+// HELPERS (Client-Side Fetching)
+// ============================================
 
+export async function getInStockLogs() {
+    // Only return logs that have juice left
     const logs = await prisma.log.findMany({
-        where: { status: 'IN_STOCK' },
-        include: {
-            supplier: true,
-            woodType: true,
+        where: {
+            remainingQuantity: { gt: 0 }
         },
+        include: { woodType: true, supplier: true },
         orderBy: { purchaseDate: 'desc' }
     })
-
-    console.log('SERVER DEBUG: Found logs:', logs.length)
     return logs
 }
 
-// Helper: Get product types for production form
-export async function getProductTypes() {
-    return prisma.productType.findMany({
+export async function getProducts() {
+    return await prisma.productType.findMany({
         orderBy: { name: 'asc' }
     })
 }
 
-// ============================================
-// WAREHOUSE / FINISHED GOODS
-// ============================================
-
 export async function getProductInventory() {
     const products = await prisma.productType.findMany({
-        orderBy: { stockCount: 'desc' } // Highest stock first
+        orderBy: { stockCount: 'desc' }
     })
 
-    const inventory = products.map(product => ({
-        id: product.id,
-        name: product.name,
-        sku: product.sku,
-        standardVolume: product.standardVolume,
-        stockCount: product.stockCount,
-        totalVolume: product.stockCount * product.standardVolume
+    const inventory = products.map(p => ({
+        id: p.id,
+        name: p.name,
+        sku: p.sku,
+        standardVolume: p.standardVolume,
+        stockCount: p.stockCount,
+        totalVolume: p.stockCount * p.standardVolume
     }))
 
-    // KPIs
     const totalItems = inventory.reduce((sum, p) => sum + p.stockCount, 0)
     const totalPoints = inventory.reduce((sum, p) => sum + p.totalVolume, 0)
-    const marketValue = totalPoints * 5000 // Rp 5000 per point
+
+    // Estimate Market Value (Rp 5,000 / point is placeholder)
+    const marketValue = totalPoints * 5000
 
     return {
         products: inventory,
-        kpis: {
-            totalItems,
-            totalPoints,
-            marketValue
-        }
-    }
-}
-
-export async function getProductHistory(productTypeId: string) {
-    const outputs = await prisma.productionOutput.findMany({
-        where: { productTypeId },
-        include: {
-            batch: true
-        },
-        orderBy: { batch: { date: 'desc' } },
-        take: 10
-    })
-
-    return outputs.map(output => ({
-        id: output.id,
-        batchDate: output.batch.date,
-        quantity: output.quantity,
-        volumeProduced: output.volumeProduced
-    }))
-}
-
-// Client-side aliases with error handling
-export async function getInStockLogs() {
-    console.log("SERVER: Fetching IN_STOCK logs...");
-    try {
-        const logs = await prisma.log.findMany({
-            where: { status: "IN_STOCK" },
-            include: { woodType: true, supplier: true },
-            orderBy: { purchaseDate: 'desc' }
-        });
-        console.log(`SERVER: Found ${logs.length} logs.`);
-        return logs;
-    } catch (error) {
-        console.error("SERVER ERROR in getInStockLogs:", error);
-        return [];
-    }
-}
-
-export async function getProducts() {
-    try {
-        return await prisma.productType.findMany({
-            orderBy: { name: 'asc' }
-        });
-    } catch (error) {
-        console.error("SERVER ERROR in getProducts:", error);
-        return [];
+        kpis: { totalItems, totalPoints, marketValue }
     }
 }

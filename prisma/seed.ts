@@ -1,5 +1,16 @@
 import { PrismaClient } from '@prisma/client';
-import { calculateLogValuation, LOG_BASIS, DIVISOR } from '../lib/calculator';
+
+// Inline calculator to avoid module resolution issues
+const LOG_BASIS = 785;
+const DIVISOR = 1_000_000;
+
+function calculateLogValuation(circumference: number, length: number, quantity: number, marketPrice: number) {
+    const diameter = circumference / 4;
+    const rawVolume = Math.pow(diameter, 2) * length * LOG_BASIS * quantity;
+    const volumeFinal = Math.floor(rawVolume / DIVISOR);
+    const totalPrice = volumeFinal * marketPrice;
+    return { diameter, rawVolume, volumeFinal, totalPrice };
+}
 
 const prisma = new PrismaClient();
 
@@ -60,6 +71,7 @@ async function main() {
             circumference: testData.circumference,
             length: testData.length,
             quantity: testData.quantity,
+            remainingQuantity: testData.quantity, // [NEW] Initialize with original quantity
             diameter: result.diameter,
             volumeRaw: result.rawVolume,
             volumeFinal: result.volumeFinal,

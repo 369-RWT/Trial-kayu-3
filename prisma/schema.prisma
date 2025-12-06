@@ -42,7 +42,10 @@ model Log {
   // Dimensions (matching spreadsheet)
   circumference Int // cm (Lingkar) - e.g., 87
   length        Int // cm (Panjang) - e.g., 300
-  quantity      Int @default(1) // Jumlah Log
+  quantity      Int @default(1) // Jumlah Log - ORIGINAL quantity bought (Immutable history)
+
+  // [NEW] The "Gas Tank" - CURRENT quantity available (Mutable)
+  remainingQuantity Int @default(1)
 
   // Stored Calculations
   diameter    Float // circumference / 4

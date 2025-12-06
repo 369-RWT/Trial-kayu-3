@@ -9,11 +9,15 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Select } from '@/components/ui/select'
+import { Slider } from '@/components/ui/slider' // Optional: If you have it, otherwise use Input
 
+// [UPDATED INTERFACE] matches the new Schema
 interface Log {
     id: string
     tagId: string
     volumeFinal: number
+    quantity: number           // Original Qty
+    remainingQuantity: number  // Available Qty
     supplier: { name: string }
     woodType: { name: string }
 }
@@ -31,6 +35,12 @@ interface OutputRow {
     quantity: number
 }
 
+// [NEW TYPE] for sending precise data to server
+export interface LogAllocation {
+    logId: string
+    qtyUsed: number
+}
+
 export default function ProductionForm({
     availableLogs,
     productTypes
@@ -39,7 +49,11 @@ export default function ProductionForm({
     productTypes: ProductType[]
 }) {
     const router = useRouter()
-    const [selectedLogIds, setSelectedLogIds] = useState<Set<string>>(new Set())
+
+    // [STATE CHANGE] Tracks how much we use of each log
+    // Key: logId, Value: quantity used
+    const [allocations, setAllocations] = useState<Record<string, number>>({})
+
     const [outputs, setOutputs] = useState<OutputRow[]>([])
     const [searchTerm, setSearchTerm] = useState('')
     const [isSubmitting, setIsSubmitting] = useState(false)
@@ -50,11 +64,17 @@ export default function ProductionForm({
         log.supplier.name.toLowerCase().includes(searchTerm.toLowerCase())
     )
 
+    // [UPDATED MATH] Calculate total input based on PARTIAL usage
     const totalInput = useMemo(() => {
-        return availableLogs
-            .filter(log => selectedLogIds.has(log.id))
-            .reduce((sum, log) => sum + log.volumeFinal, 0)
-    }, [availableLogs, selectedLogIds])
+        return Object.entries(allocations).reduce((sum, [logId, qtyUsed]) => {
+            const log = availableLogs.find(l => l.id === logId)
+            if (!log || log.quantity === 0) return sum
+
+            // Formula: (Points / OriginalQty) * UsedQty
+            const pointsPerUnit = log.volumeFinal / log.quantity
+            return sum + (pointsPerUnit * qtyUsed)
+        }, 0)
+    }, [availableLogs, allocations])
 
     const totalOutput = useMemo(() => {
         return outputs.reduce((sum, output) => {
@@ -65,23 +85,40 @@ export default function ProductionForm({
 
     const waste = totalInput - totalOutput
 
-    const toggleLog = (logId: string) => {
-        setSelectedLogIds(prev => {
-            const next = new Set(prev)
-            if (next.has(logId)) next.delete(logId)
-            else next.add(logId)
+    // [LOGIC UPDATE] Toggle now initializes quantity
+    const toggleLog = (log: Log) => {
+        setAllocations(prev => {
+            const next = { ...prev }
+            if (next[log.id]) {
+                delete next[log.id] // Deselect
+            } else {
+                next[log.id] = log.remainingQuantity // Default to MAX available
+            }
             return next
         })
     }
 
+    const updateAllocation = (logId: string, value: number, max: number) => {
+        const cleanValue = Math.min(Math.max(0, value), max)
+        setAllocations(prev => ({
+            ...prev,
+            [logId]: cleanValue
+        }))
+    }
+
     const selectAllLogs = () => {
-        if (selectedLogIds.size === filteredLogs.length) {
-            setSelectedLogIds(new Set())
+        if (Object.keys(allocations).length === filteredLogs.length) {
+            setAllocations({})
         } else {
-            setSelectedLogIds(new Set(filteredLogs.map(l => l.id)))
+            const newAllocations: Record<string, number> = {}
+            filteredLogs.forEach(l => {
+                newAllocations[l.id] = l.remainingQuantity
+            })
+            setAllocations(newAllocations)
         }
     }
 
+    // ... [addOutputRow, updateOutput, removeOutput remain the same] ...
     const addOutputRow = () => {
         setOutputs(prev => [...prev, {
             id: crypto.randomUUID(),
@@ -100,21 +137,29 @@ export default function ProductionForm({
         setOutputs(prev => prev.filter(row => row.id !== id))
     }
 
-    const canSubmit = selectedLogIds.size > 0 && outputs.length > 0 && waste >= 0 && !isSubmitting
+    const canSubmit = Object.keys(allocations).length > 0 && outputs.length > 0 && waste >= 0 && !isSubmitting
 
     const handleSubmit = async () => {
         if (!canSubmit) return
         setIsSubmitting(true)
         setToast(null)
 
-        const result = await recordProductionRun(
-            new Date(),
-            Array.from(selectedLogIds),
-            outputs.filter(o => o.productTypeId && o.quantity > 0).map(o => ({
+        // Convert allocations map to array for server action
+        const allocationList: LogAllocation[] = Object.entries(allocations).map(([logId, qtyUsed]) => ({
+            logId,
+            qtyUsed
+        }))
+
+        // [IMPORTANT] You must update 'recordProductionRun' signature in actions.ts 
+        // to accept 'allocationList' instead of just 'logIds'
+        const result = await recordProductionRun({
+            batchDate: new Date(),
+            allocations: allocationList, // <--- New Payload
+            outputs: outputs.filter(o => o.productTypeId && o.quantity > 0).map(o => ({
                 productTypeId: o.productTypeId,
                 quantity: o.quantity
             }))
-        )
+        })
 
         if (result.success) {
             setToast({ type: 'success', message: `Production recorded! Efficiency: ${result.summary?.efficiency}%` })
@@ -127,7 +172,7 @@ export default function ProductionForm({
 
     return (
         <div className="min-h-screen bg-slate-100">
-            {/* Safety Header - Waste Monitor */}
+            {/* ... [Header/Toast section remains same] ... */}
             <div className={`sticky top-0 z-20 py-3 px-6 border-b transition-colors duration-300 ${waste < 0
                 ? 'bg-red-600 text-white'
                 : waste === 0 && totalInput > 0
@@ -169,7 +214,6 @@ export default function ProductionForm({
                 </div>
             </div>
 
-            {/* Toast */}
             <AnimatePresence>
                 {toast && (
                     <motion.div
@@ -184,7 +228,6 @@ export default function ProductionForm({
                 )}
             </AnimatePresence>
 
-            {/* Main Content */}
             <div className="max-w-7xl mx-auto p-6">
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
@@ -192,9 +235,9 @@ export default function ProductionForm({
                     <Card className="flex flex-col h-[calc(100vh-180px)] border-slate-200 shadow-sm">
                         <CardHeader className="pb-3 border-b bg-slate-50/50">
                             <div className="flex items-center justify-between">
-                                <CardTitle className="text-lg font-semibold text-slate-800">Raw Material (Log Inventory)</CardTitle>
-                                <Badge variant="secondary" className="font-mono bg-slate-200 text-slate-700 hover:bg-slate-300">
-                                    {selectedLogIds.size} Selected
+                                <CardTitle className="text-lg font-semibold text-slate-800">Raw Material</CardTitle>
+                                <Badge variant="secondary" className="font-mono bg-slate-200 text-slate-700">
+                                    {Object.keys(allocations).length} Batches Used
                                 </Badge>
                             </div>
                             <div className="flex gap-2 mt-3">
@@ -205,64 +248,106 @@ export default function ProductionForm({
                                     className="flex-1 bg-white"
                                 />
                                 <Button variant="outline" size="sm" onClick={selectAllLogs} className="bg-white">
-                                    {selectedLogIds.size === filteredLogs.length ? 'Deselect All' : 'Select All'}
+                                    {Object.keys(allocations).length === filteredLogs.length ? 'Deselect All' : 'Select All'}
                                 </Button>
                             </div>
                         </CardHeader>
 
-                        <CardContent className="flex-1 overflow-auto">
-                            <div className="space-y-2">
+                        <CardContent className="flex-1 overflow-auto bg-slate-50/30 p-4">
+                            <div className="space-y-3">
                                 {filteredLogs.length === 0 ? (
                                     <p className="text-center text-slate-400 py-8">No logs available</p>
                                 ) : (
-                                    filteredLogs.map(log => (
-                                        <div
-                                            key={log.id}
-                                            onClick={() => toggleLog(log.id)}
-                                            className={`p-3 rounded-lg border cursor-pointer transition-all ${selectedLogIds.has(log.id)
-                                                ? 'bg-slate-900 text-white border-slate-900'
-                                                : 'bg-white hover:bg-slate-50 border-slate-200'
-                                                }`}
-                                        >
-                                            <div className="flex items-center justify-between">
-                                                <div className="flex items-center gap-3">
-                                                    <div className={`w-5 h-5 rounded border-2 flex items-center justify-center ${selectedLogIds.has(log.id) ? 'bg-white border-white' : 'border-slate-300'
-                                                        }`}>
-                                                        {selectedLogIds.has(log.id) && (
-                                                            <svg className="w-3 h-3 text-slate-900" fill="currentColor" viewBox="0 0 20 20">
-                                                                <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                                                            </svg>
-                                                        )}
+                                    filteredLogs.map(log => {
+                                        const isSelected = !!allocations[log.id];
+                                        const qty = allocations[log.id] || 0;
+
+                                        return (
+                                            <div
+                                                key={log.id}
+                                                className={`rounded-lg border transition-all duration-200 ${isSelected
+                                                    ? 'bg-white border-slate-900 shadow-md ring-1 ring-slate-900'
+                                                    : 'bg-white hover:bg-slate-50 border-slate-200'
+                                                    }`}
+                                            >
+                                                {/* Header Row: Clickable */}
+                                                <div
+                                                    onClick={() => toggleLog(log)}
+                                                    className="p-3 cursor-pointer flex items-center justify-between"
+                                                >
+                                                    <div className="flex items-center gap-3">
+                                                        <div className={`w-5 h-5 rounded border-2 flex items-center justify-center transition-colors ${isSelected ? 'bg-slate-900 border-slate-900' : 'border-slate-300'
+                                                            }`}>
+                                                            {isSelected && (
+                                                                <svg className="w-3 h-3 text-white" fill="currentColor" viewBox="0 0 20 20">
+                                                                    <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                                                                </svg>
+                                                            )}
+                                                        </div>
+                                                        <div>
+                                                            <p className="font-mono font-bold text-sm text-slate-900">{log.tagId}</p>
+                                                            <p className="text-xs text-slate-500">
+                                                                {log.woodType.name} • {log.remainingQuantity} avail
+                                                            </p>
+                                                        </div>
                                                     </div>
-                                                    <div>
-                                                        <p className="font-mono font-bold text-sm">{log.tagId}</p>
-                                                        <p className={`text-xs ${selectedLogIds.has(log.id) ? 'text-slate-300' : 'text-slate-500'}`}>
-                                                            {log.supplier.name} • {log.woodType.name}
-                                                        </p>
+                                                    <div className="text-right">
+                                                        <p className="font-bold text-slate-700">{Math.round(log.volumeFinal / log.quantity * qty)}</p>
+                                                        <p className="text-xs text-slate-400">pts selected</p>
                                                     </div>
                                                 </div>
-                                                <div className="text-right">
-                                                    <p className="font-bold">{log.volumeFinal}</p>
-                                                    <p className={`text-xs ${selectedLogIds.has(log.id) ? 'text-slate-300' : 'text-slate-400'}`}>Points</p>
-                                                </div>
+
+                                                {/* Expanded Selection Area */}
+                                                <AnimatePresence>
+                                                    {isSelected && (
+                                                        <motion.div
+                                                            initial={{ height: 0, opacity: 0 }}
+                                                            animate={{ height: 'auto', opacity: 1 }}
+                                                            exit={{ height: 0, opacity: 0 }}
+                                                            className="overflow-hidden border-t border-slate-100"
+                                                        >
+                                                            <div className="p-3 bg-slate-50/50 flex items-center gap-3">
+                                                                <span className="text-xs font-medium text-slate-500 uppercase">Use:</span>
+                                                                <Input
+                                                                    type="number"
+                                                                    min={1}
+                                                                    max={log.remainingQuantity}
+                                                                    value={qty}
+                                                                    onChange={(e) => updateAllocation(log.id, parseInt(e.target.value) || 0, log.remainingQuantity)}
+                                                                    className="h-8 w-20 bg-white font-bold text-center"
+                                                                />
+                                                                <span className="text-sm text-slate-400">/ {log.remainingQuantity} pcs</span>
+
+                                                                <input
+                                                                    type="range"
+                                                                    min={1}
+                                                                    max={log.remainingQuantity}
+                                                                    value={qty}
+                                                                    onChange={(e) => updateAllocation(log.id, parseInt(e.target.value), log.remainingQuantity)}
+                                                                    className="flex-1 accent-slate-900 h-2"
+                                                                />
+                                                            </div>
+                                                        </motion.div>
+                                                    )}
+                                                </AnimatePresence>
                                             </div>
-                                        </div>
-                                    ))
+                                        )
+                                    })
                                 )}
                             </div>
                         </CardContent>
 
                         <div className="border-t bg-slate-50 p-4">
                             <div className="flex items-center justify-between">
-                                <span className="text-sm text-slate-600">Selected Input</span>
+                                <span className="text-sm text-slate-600">Total Input Value</span>
                                 <span className="text-2xl font-bold text-slate-900">
-                                    {totalInput.toLocaleString()} <span className="text-sm font-normal text-slate-500">Points</span>
+                                    {totalInput.toLocaleString()} <span className="text-sm font-normal text-slate-500">Pts</span>
                                 </span>
                             </div>
                         </div>
                     </Card>
 
-                    {/* RIGHT: Production Output */}
+                    {/* RIGHT: Production Output (Same as before) */}
                     <Card className="flex flex-col h-[calc(100vh-180px)] border-slate-200 shadow-sm">
                         <CardHeader className="pb-3 border-b bg-slate-50/50">
                             <div className="flex items-center justify-between">
